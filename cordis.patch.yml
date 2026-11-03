@@ -1,0 +1,30 @@
+﻿# GPT (ChatGPT / Codex) bundle for DeepSeek Harness.
+#
+# This bundle declares the plugin row. It deliberately does NOT patch
+# `llm-pi-ai`: a Cordis patch replaces a matched entry's whole config instead of
+# deep-merging it, and the profile's own cordis.patch.yml already carries
+# `llm-pi-ai`'s providers — a bundle-level patch would be replaced at the
+# profile layer. The plugin adds the `openai-codex` route through
+# `ctx.settings.mutate()`, the same write path the Models page uses, so the
+# value lands in the layer that actually wins.
+#
+# codexAuthPath:       override where the Codex CLI keeps auth.json.
+#                      Empty means $CODEX_HOME or ~/.codex.
+# proxy:               HTTP(S) proxy for auth.openai.com and chatgpt.com.
+#                      Empty means fall back to HTTPS_PROXY/HTTP_PROXY, then
+#                      direct. The plugin also sets NODE_USE_ENV_PROXY=1 for the
+#                      process, because Node's global fetch ignores those
+#                      variables otherwise — and pi-ai's model requests go
+#                      through that global fetch. Set this whenever the app
+#                      cannot reach OpenAI directly.
+# autoEnableRoute:     add the openai-codex provider route automatically once a
+#                      ChatGPT credential exists. Set false to configure it by
+#                      hand.
+
+- insert:
+    - id: gpt-codex
+      name: 'dsh-gpt-codex'
+      config:
+        codexAuthPath: ''
+        proxy: 'http://127.0.0.1:7897'
+        autoEnableRoute: true

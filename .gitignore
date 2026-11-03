@@ -1,0 +1,25 @@
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# Test / build output
+coverage/
+*.tsbuildinfo
+
+# Local evidence extracted from the installed application.
+# Regenerate with tools/extract-asar.mjs — see docs/ for why it is not vendored:
+# it is a packaged copy of a third-party application, not this project's source.
+evidence/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local scratch
+*.local
+tmp_*

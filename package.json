@@ -1,0 +1,44 @@
+{
+  "name": "dsh-gpt-codex",
+  "version": "0.1.0",
+  "description": "Use a ChatGPT subscription to drive GPT models inside DeepSeek Harness: sign in with the built-in OpenAI Codex OAuth flow (or reuse an existing Codex CLI login), enable the openai-codex route, and verify the credential with a real request",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bhjia-phys/dsh-gpt-codex.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "chatgpt",
+    "codex",
+    "openai",
+    "oauth",
+    "pi-ai"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test-host.mjs && node test-contract.mjs",
+    "test:host": "node test-host.mjs",
+    "test:contract": "node test-contract.mjs"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "immediately": true }
+  }
+}
