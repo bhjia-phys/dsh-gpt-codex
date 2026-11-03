@@ -1,4 +1,4 @@
-﻿# 桌面版 0.2.1-rc.5：用 ChatGPT 订阅跑 GPT 的链路与插件边界
+# 桌面版 0.2.1-rc.5：用 ChatGPT 订阅跑 GPT 的链路与插件边界
 
 证据根：`../evidence/asar/`（下列「lib/index.js」「README.md」等均指该目录内、文件名把 `/` 换成 `__` 的解包副本，例如 `__dsh__node_modules__@deepseek-ai__dsh-llm-pi-ai__lib__index.js`）。这一份是笔记引用到的 23 个文件，共 0.8 MB；要取别的文件用 `node tools/extract-asar.mjs get <asar 内路径>`，全量索引见 `evidence/asar-index.txt`。
 范围：只做静态核实 + 只读探测；未发起任何 OAuth 登录，未改 profile / credentials / asar。

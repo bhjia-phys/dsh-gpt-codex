@@ -1,4 +1,4 @@
-﻿# AITP-agent 上游「GPT 适配 + ChatGPT 官方登录」实现清单
+# AITP-agent 上游「GPT 适配 + ChatGPT 官方登录」实现清单
 
 考古对象：`F:\AI_Workspace\dsh-aitp\_upstream\extracted\AITP-agent-main`（fork 根 `package.json` version = `0.2.1-rc.2`，`_upstream/extracted/AITP-agent-main/package.json:1`）。
 对照对象：本机安装的官方桌面版 `0.2.1-rc.5`，`<DSH_INSTALL>\resources\app.asar`（`/dsh/node_modules/...`，下文记作 `app.asar:`）。

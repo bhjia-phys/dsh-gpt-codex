@@ -1,4 +1,4 @@
-﻿# dsh-gpt-codex — 用 ChatGPT 订阅驱动 DeepSeek Harness 桌面版
+# dsh-gpt-codex — 用 ChatGPT 订阅驱动 DeepSeek Harness 桌面版
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 

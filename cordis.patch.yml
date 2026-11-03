@@ -1,4 +1,4 @@
-﻿# GPT (ChatGPT / Codex) bundle for DeepSeek Harness.
+# GPT (ChatGPT / Codex) bundle for DeepSeek Harness.
 #
 # This bundle declares the plugin row. It deliberately does NOT patch
 # `llm-pi-ai`: a Cordis patch replaces a matched entry's whole config instead of

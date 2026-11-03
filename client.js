@@ -1,4 +1,4 @@
-﻿/**
+/**
  * GPT (ChatGPT / Codex) adapter — Client half.
  *
  * A settings page that answers one question and offers the two actions the Host
