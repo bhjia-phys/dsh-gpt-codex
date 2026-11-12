@@ -1,6 +1,6 @@
 {
   "name": "dsh-gpt-codex",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Use a ChatGPT subscription to drive GPT models inside DeepSeek Harness: sign in with the built-in OpenAI Codex OAuth flow (or reuse an existing Codex CLI login), enable the openai-codex route, and verify the credential with a real request",
   "type": "module",
   "license": "MIT",
@@ -20,12 +20,14 @@
   ],
   "exports": {
     ".": "./index.js",
+    "./stream-repair": "./stream-repair.js",
     "./client": "./client.js",
     "./package.json": "./package.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
+    "stream-repair.js",
     "client.js",
     "cordis.patch.yml",
     "icon.svg",
@@ -33,9 +35,12 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test-host.mjs && node test-contract.mjs",
+    "test": "node test-host.mjs && node test-contract.mjs && node test-json.mjs && node test-proxy.mjs && node test-stream-repair.mjs",
     "test:host": "node test-host.mjs",
-    "test:contract": "node test-contract.mjs"
+    "test:contract": "node test-contract.mjs",
+    "test:json": "node test-json.mjs",
+    "test:proxy": "node test-proxy.mjs",
+    "test:stream": "node test-stream-repair.mjs"
   },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },

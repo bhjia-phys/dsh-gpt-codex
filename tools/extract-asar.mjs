@@ -53,11 +53,16 @@ const ASAR = process.env.DSH_ASAR || defaultAsarPath();
 /**
  * Read an asar archive's file index.
  *
- * The format: an 8-byte pickle header, a 4-byte header size, a JSON directory
- * whose leaf entries carry `{ offset, size }` relative to the content start.
- * Content begins after 16 bytes of framing plus the JSON header; entries whose
- * `offset` is a non-numeric string must be skipped (asar encodes "unpacked"
- * markers that way, and `Number()` on them yields NaN).
+ * The format: an 8-byte pickle header, then a pickle whose 4th byte-pair (offset
+ * 4) is the total header size — including that 4-byte length field itself — then
+ * the JSON directory whose leaf entries carry `{ offset, size }` relative to the
+ * content start. Content therefore begins at `8 + header[4]`.
+ *
+ * `16 + headerSize` is the tempting formula and it is wrong whenever the JSON is
+ * padded (0-3 bytes): every extracted file then begins with the tail of its
+ * predecessor, e.g. `mapimport {` instead of `import {`. Entries whose `offset`
+ * is a non-numeric string must be skipped (asar encodes "unpacked" markers that
+ * way, and `Number()` on them yields NaN).
  */
 async function readIndex(archive) {
   const handle = await fsp.open(archive, 'r');
@@ -65,6 +70,7 @@ async function readIndex(archive) {
     const framing = Buffer.alloc(16);
     await handle.read(framing, 0, 16, 0);
     const headerSize = framing.readUInt32LE(12);
+    const base = 8 + framing.readUInt32LE(4);
 
     const raw = Buffer.alloc(headerSize);
     await handle.read(raw, 0, headerSize, 16);
@@ -85,7 +91,7 @@ async function readIndex(archive) {
     };
     walk(tree, '');
 
-    return { handle, files, base: 16 + headerSize };
+    return { handle, files, base };
   } catch (error) {
     await handle.close();
     throw error;

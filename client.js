@@ -195,7 +195,9 @@ window.__ModuleLoader__.load({
           const result = await call('/sign-in', { method: 'POST', body: { mode: 'codex-cli' } });
           const routeNote =
             result.route?.changed === true
-              ? '已自动补上 openai-codex 这条 route。'
+              ? result.route?.reason === 'upgraded'
+                ? '已把旧版 route 升级（补上 MALFORMED_RESPONSE 重试）。'
+                : '已自动补上 openai-codex 这条 route。'
               : result.route?.reason === 'already-configured'
                 ? 'route 早已存在。'
                 : `route 未改动（${result.route?.reason ?? 'unknown'}）。`;
@@ -232,7 +234,8 @@ window.__ModuleLoader__.load({
       const enableRoute = () =>
         run('route', async () => {
           const result = await call('/route/enable', { method: 'POST', body: {} });
-          return result.changed ? '已启用 openai-codex route。' : `route 未改动（${result.reason}）。`;
+          if (result.changed !== true) return `route 未改动（${result.reason}）。`;
+          return result.reason === 'upgraded' ? '已给这条 route 补上 MALFORMED_RESPONSE 重试。' : '已启用 openai-codex route。';
         });
 
       /**
@@ -314,6 +317,20 @@ window.__ModuleLoader__.load({
               ? React.createElement('span', { style: styles.badge('on') }, '已启用')
               : React.createElement('span', { style: styles.badge('off') }, '未启用'),
           ),
+          route.configured
+            ? React.createElement(
+                Row,
+                { label: '流式工具调用修复' },
+                route.retriesMalformed === true
+                  ? '按 id 纠正并行调用位置；参数解析失败时重试'
+                  : React.createElement(
+                      'span',
+                      null,
+                      React.createElement('span', { style: styles.badge('off') }, '部分启用'),
+                      ' route 里没有 MALFORMED_RESPONSE 重试；点「补上重试」写入',
+                    ),
+              )
+            : null,
           React.createElement(
             Row,
             { label: '浏览器 OAuth' },
@@ -345,6 +362,13 @@ window.__ModuleLoader__.load({
                   { type: 'button', style: styles.button, disabled: busy !== '', onClick: enableRoute },
                   busy === 'route' ? '启用中…' : '仅启用 route',
                 ),
+            route.configured && route.retriesMalformed !== true
+              ? React.createElement(
+                  'button',
+                  { type: 'button', style: styles.button, disabled: busy !== '', onClick: enableRoute },
+                  busy === 'route' ? '写入中…' : '补上重试',
+                )
+              : null,
             credential.configured
               ? React.createElement(
                   'button',

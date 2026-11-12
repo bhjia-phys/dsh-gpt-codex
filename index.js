@@ -36,8 +36,11 @@
  */
 
 import { existsSync, promises as fsp } from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+
+import { installStreamRepair, resolveRepairEndpoints } from './stream-repair.js';
 
 /** Credential-record scope `dsh-llm-pi-ai` reads and writes. */
 const RECORD_SCOPE = 'llm-pi-ai';
@@ -96,6 +99,13 @@ function decodeJwtPayload(token) {
   }
 }
 
+/** Keep untrusted JWT/refresh timestamps finite before they enter JSON records. */
+function secondsToMs(seconds) {
+  if (typeof seconds !== 'number') return undefined;
+  const milliseconds = seconds * 1000;
+  return Number.isFinite(milliseconds) ? milliseconds || 0 : undefined;
+}
+
 function accountIdFromAccessToken(accessToken) {
   const auth = decodeJwtPayload(accessToken)?.[JWT_CLAIM_PATH];
   const accountId = auth?.chatgpt_account_id;
@@ -134,12 +144,12 @@ function recordFromCodexAuth(auth) {
   const accountId = accountIdFromAccessToken(access) ?? (typeof tokens.account_id === 'string' ? tokens.account_id : undefined);
   if (accountId === undefined) return { error: '无法从 access token 里读出厂 ChatGPT 账号 id' };
 
-  const expires = typeof payload?.exp === 'number' ? payload.exp * 1000 : Date.now();
+  const expires = secondsToMs(payload?.exp) ?? Date.now();
   const planType = payload?.[JWT_CLAIM_PATH]?.chatgpt_plan_type;
 
   return {
     record: { kind: 'grant', payload: { type: 'oauth', access, refresh, expires, accountId } },
-    facts: { accountId, expires, planType: typeof planType === 'string' ? planType : undefined },
+    facts: { accountId, expires, ...(typeof planType === 'string' ? { planType } : {}) },
   };
 }
 
@@ -163,9 +173,9 @@ const CODEX_TOKEN_URL = 'https://auth.openai.com/oauth/token';
  * ignores `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY=1` is set at process start,
  * which an already-running desktop app cannot acquire retroactively.
  *
- * So this plugin resolves a proxy URL itself and hands each request an explicit
- * `dispatcher`. The order favours what a user explicitly configured here, then
- * what the process environment says, then the documented local defaults.
+ * The plugin resolves a proxy URL for the global dispatcher. Explicit plugin
+ * configuration takes precedence over the process environment; otherwise
+ * requests connect directly.
  *
  * @param configured - the plugin's own `proxy` config value, '' for unset.
  * @returns a proxy URL, or undefined to connect directly.
@@ -181,53 +191,24 @@ function resolveProxyUrl(configured) {
 }
 
 /**
- * Put a proxy under Node's global `fetch`, which is what pi-ai's model requests
- * actually use.
+ * Configure the dispatcher used by pi-ai's global fetch, including when another
+ * plugin has already initialized it. Changing NODE_USE_ENV_PROXY at runtime
+ * alone does not rebuild that dispatcher. Requires Node >= 24.14.
  *
- * This is the load-bearing fix for the "处理失败 / Your authentication token has
- * expired" report, and the reasoning is entirely mechanical:
- *
- *   1. `auth.openai.com` and `chatgpt.com` time out on a direct connection from
- *      this machine and answer normally through a local proxy.
- *   2. Node's global `fetch` ignores `HTTP(S)_PROXY` unless `NODE_USE_ENV_PROXY`
- *      is set when it first reads that configuration — a flag the process can
- *      still set on itself, but nobody did, so the app connected directly.
- *   3. pi-ai's SSE path calls `(options?.fetch ?? globalThis.fetch)(...)`
- *      (`openai-codex-responses.js:267`) and the shipped `dsh-llm-pi-ai` passes
- *      no `fetch` option, so every model request lands on the global.
- *
- * So a per-request dispatcher would fix only this plugin's own two calls and
- * leave the *model* path broken — the confusing state where the status page looks
- * fine and chat still fails. Setting the process-level switch covers both.
- *
- * Why not `undici.ProxyAgent`: `undici` is not installed as a package anywhere in
- * this app (Node has it internal, and `require('undici')` fails from both the app
- * and the profile). The environment switch is the supported, dependency-free path.
- *
- * @returns a disposer that restores the previous environment, or undefined when
- *   no proxy was requested.
+ * @returns A disposer restoring the previous agents and dispatcher, or undefined
+ *   when no proxy was requested. The process environment is left intact.
  */
 function installProcessProxy(proxyUrl) {
   if (proxyUrl === undefined) return undefined;
-  const previous = {
-    NODE_USE_ENV_PROXY: process.env.NODE_USE_ENV_PROXY,
-    HTTPS_PROXY: process.env.HTTPS_PROXY,
-    HTTP_PROXY: process.env.HTTP_PROXY,
-    https_proxy: process.env.https_proxy,
-    http_proxy: process.env.http_proxy,
-  };
-  process.env.NODE_USE_ENV_PROXY = '1';
-  process.env.HTTPS_PROXY = proxyUrl;
-  process.env.HTTP_PROXY = proxyUrl;
-  process.env.https_proxy = proxyUrl;
-  process.env.http_proxy = proxyUrl;
-
-  return () => {
-    for (const [name, value] of Object.entries(previous)) {
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
-  };
+  if (typeof http.setGlobalProxyFromEnv !== 'function') {
+    throw new Error('GPT 代理需要 Node.js 24.14 或更新版本；请更新 DeepSeek Harness 桌面版。');
+  }
+  const bypass = process.env.no_proxy ?? process.env.NO_PROXY ?? '';
+  return http.setGlobalProxyFromEnv({
+    http_proxy: proxyUrl,
+    https_proxy: proxyUrl,
+    no_proxy: [bypass, 'localhost', '127.0.0.1', '::1'].filter(Boolean).join(','),
+  });
 }
 
 /**
@@ -286,8 +267,10 @@ async function refreshGrant(refreshToken, signal, proxyUrl) {
   const payload = decodeJwtPayload(access);
   const accountId = payload?.[JWT_CLAIM_PATH]?.chatgpt_account_id;
   if (typeof accountId !== 'string' || accountId === '') return { error: '刷新后的 token 里没有 ChatGPT 账号 id' };
-  const expires =
-    typeof body?.expires_in === 'number' ? Date.now() + body.expires_in * 1000 : typeof payload?.exp === 'number' ? payload.exp * 1000 : Date.now();
+  const now = Date.now();
+  const duration = secondsToMs(body?.expires_in);
+  const refreshedExpiry = duration === undefined ? undefined : now + duration;
+  const expires = Number.isFinite(refreshedExpiry) ? refreshedExpiry : secondsToMs(payload?.exp) ?? now;
   const planType = payload?.[JWT_CLAIM_PATH]?.chatgpt_plan_type;
 
   return {
@@ -295,7 +278,7 @@ async function refreshGrant(refreshToken, signal, proxyUrl) {
     refresh: nextRefresh,
     expires,
     accountId,
-    planType: typeof planType === 'string' ? planType : undefined,
+    ...(typeof planType === 'string' ? { planType } : {}),
   };
 }
 
@@ -401,14 +384,13 @@ function describeRecord(record) {
   if (record === undefined) return { configured: false };
   if (record.kind === 'api-key') return { configured: true, kind: 'api-key' };
   const payload = record.payload ?? {};
-  const expires = typeof payload.expires === 'number' ? payload.expires : undefined;
+  const expires = typeof payload.expires === 'number' && Number.isFinite(payload.expires) ? payload.expires || 0 : undefined;
   return {
     configured: true,
     kind: 'grant',
-    type: typeof payload.type === 'string' ? payload.type : undefined,
-    accountId: typeof payload.accountId === 'string' ? payload.accountId : undefined,
-    expires,
-    expired: expires !== undefined ? expires <= Date.now() : undefined,
+    ...(typeof payload.type === 'string' ? { type: payload.type } : {}),
+    ...(typeof payload.accountId === 'string' ? { accountId: payload.accountId } : {}),
+    ...(expires === undefined ? {} : { expires, expired: expires <= Date.now() }),
     hasRefresh: typeof payload.refresh === 'string' && payload.refresh.length > 0,
   };
 }
@@ -425,11 +407,22 @@ export function apply(ctx, rawConfig) {
     codexAuthPath: rawConfig?.codexAuthPath ? String(rawConfig.codexAuthPath) : '',
     proxy: resolveProxyUrl(rawConfig?.proxy),
     autoEnableRoute: rawConfig?.autoEnableRoute !== false,
+    // Extra stream endpoints on top of the Codex backend, for relays that
+    // re-serve `openai-codex` from a different base URL.
+    endpoints: Array.isArray(rawConfig?.endpoints) ? rawConfig.endpoints : [],
+    // Retry `MALFORMED_RESPONSE` on the route this plugin owns: the repair above
+    // fixes a reused slot, but a genuinely corrupt argument string can only be
+    // recovered by asking the model again.
+    retryMalformed: rawConfig?.retryMalformedResponses !== false,
   };
 
   const authFilePath = () => settings.codexAuthPath || codexAuthFile();
   const credentials = () => ctx.get('credentials');
   const settingsService = () => ctx.get('settings');
+
+  /** Counters for {@link installStreamRepair}; read by `GET /gpt-codex/stream-repair`. */
+  const streamRepairStats = { responses: 0, repairedEvents: 0 };
+  const STREAM_REPAIR_VERSION = '0.2.0';
 
   // ------------------------------------------------------------ provider route ---
 
@@ -456,12 +449,55 @@ export function apply(ctx, rawConfig) {
    */
   const ROUTE_PROFILE = { transport: 'sse' };
 
+  /**
+   * Codes the shipped default retry policy retries.
+   *
+   * `dsh-llm` retries EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT and TRANSPORT,
+   * and deliberately leaves `MALFORMED_RESPONSE` out (being a `retryChoice` does
+   * not add it to the default set). A reused tool-call slot arrives as exactly
+   * that code, so without this the whole turn stops on its first attempt — which
+   * is what the bug report shows: one bad response, then nothing.
+   */
+  const DEFAULT_RETRY_CODES = ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT'];
+
+  /** The route profile this plugin recommends, given its configuration. */
+  const routeProfile = () => {
+    if (!settings.retryMalformed) return { ...ROUTE_PROFILE };
+    return {
+      ...ROUTE_PROFILE,
+      retryPolicy: {
+        mode: 'normal',
+        maxRetries: 2,
+        retryableCodes: [...DEFAULT_RETRY_CODES, 'MALFORMED_RESPONSE'],
+      },
+    };
+  };
+
+  /** Order-insensitive JSON image, for comparing a stored profile with a target. */
+  const stableImage = (value) => {
+    if (Array.isArray(value)) return `[${value.map(stableImage).join(',')}]`;
+    if (value !== null && typeof value === 'object') {
+      return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableImage(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+  };
+
   /** Whether an existing profile is exactly the shape this plugin recommends. */
   const sameProfile = (current) => {
     if (current === null || typeof current !== 'object') return false;
-    const keys = Object.keys(current);
-    return keys.length === 1 && current.transport === ROUTE_PROFILE.transport;
+    return stableImage(current) === stableImage(routeProfile());
   };
+
+  /**
+   * Whether a stored profile is the shape an earlier version of this plugin
+   * wrote, and nothing else.
+   *
+   * That is indistinguishable from something the user typed, but it is only
+   * `transport: 'sse'` — the recommended transport — so adding the retry policy
+   * cannot contradict a deliberate choice. Anything with another field, another
+   * transport, or a policy of its own stays untouched.
+   */
+  const isLegacyOwnProfile = (current) => stableImage(current) === stableImage(ROUTE_PROFILE);
 
   const ensureRoute = async () => {
     const service = settingsService();
@@ -475,12 +511,23 @@ export function apply(ctx, rawConfig) {
     if (descriptor === void 0) return { changed: false, reason: 'no-llm-pi-ai-entry' };
     const providers = descriptor.value?.providers;
     if (providers && Object.hasOwn(providers, PROVIDER)) {
-      // Present already: never touch it. A user's own configuration — another
-      // transport, a pinned model list, a custom endpoint — always wins.
-      return { changed: false, reason: sameProfile(providers[PROVIDER]) ? 'already-configured' : 'already-configured-differently' };
+      const current = providers[PROVIDER];
+      if (sameProfile(current)) return { changed: false, reason: 'already-configured' };
+      // A route an earlier version of this plugin wrote is upgraded in place;
+      // anything a user tuned — another transport, a pinned model list, their own
+      // retry policy — always wins.
+      if (!settings.retryMalformed || !isLegacyOwnProfile(current)) {
+        return { changed: false, reason: 'already-configured-differently' };
+      }
+      try {
+        await service.mutate(SETTINGS_NS, [{ op: 'set', path: ['providers', PROVIDER], value: routeProfile() }], descriptor.revision);
+        return { changed: true, reason: 'upgraded' };
+      } catch (error) {
+        return { changed: false, reason: `mutate failed: ${error && error.message ? error.message : String(error)}` };
+      }
     }
     try {
-      await service.mutate(SETTINGS_NS, [{ op: 'set', path: ['providers', PROVIDER], value: { ...ROUTE_PROFILE } }], descriptor.revision);
+      await service.mutate(SETTINGS_NS, [{ op: 'set', path: ['providers', PROVIDER], value: routeProfile() }], descriptor.revision);
       return { changed: true, reason: 'added' };
     } catch (error) {
       return { changed: false, reason: `mutate failed: ${error && error.message ? error.message : String(error)}` };
@@ -508,12 +555,12 @@ export function apply(ctx, rawConfig) {
         codexCli = {
           path: file,
           present: true,
-          authMode: typeof parsed.auth_mode === 'string' ? parsed.auth_mode : undefined,
+          // Tool outputs cross a lossless-JSON boundary without HTTP's implicit
+          // stringify cleanup: unavailable facts must be absent, not undefined.
+          ...(typeof parsed.auth_mode === 'string' ? { authMode: parsed.auth_mode } : {}),
           bridgeable: bridged.record !== undefined,
-          bridgeError: bridged.error,
-          planType: bridged.facts?.planType,
-          accountId: bridged.facts?.accountId,
-          expires: bridged.facts?.expires,
+          ...(bridged.error === undefined ? {} : { bridgeError: bridged.error }),
+          ...(bridged.facts ?? {}),
         };
       } catch (error) {
         codexCli = { path: file, present: true, error: error && error.message ? error.message : String(error) };
@@ -526,7 +573,13 @@ export function apply(ctx, rawConfig) {
       try {
         const descriptor = service.describe().find((row) => row.ns === SETTINGS_NS);
         const providers = descriptor?.value?.providers;
-        route = { configured: Boolean(providers && Object.hasOwn(providers, PROVIDER)) };
+        const profile = providers?.[PROVIDER];
+        route = {
+          configured: Boolean(providers && Object.hasOwn(providers, PROVIDER)),
+          // Whether this route will actually recover from the malformed
+          // tool-argument response a reused stream slot produces.
+          retriesMalformed: profile?.retryPolicy?.retryableCodes?.includes?.('MALFORMED_RESPONSE') === true,
+        };
       } catch {
         route = { configured: false, error: 'cannot read settings' };
       }
@@ -639,10 +692,14 @@ export function apply(ctx, rawConfig) {
     await commitRecord(record);
     const route = await ensureRoute();
     return {
-      ...bridged.facts,
       ...(refreshed.error === undefined
-        ? { accountId: refreshed.accountId, expires: refreshed.expires, planType: refreshed.planType, tokenSource: 'refreshed' }
-        : { tokenSource: 'codex-cli-file', refreshWarning: refreshed.error }),
+        ? {
+            accountId: refreshed.accountId,
+            expires: refreshed.expires,
+            ...(refreshed.planType === undefined ? {} : { planType: refreshed.planType }),
+            tokenSource: 'refreshed',
+          }
+        : { ...bridged.facts, tokenSource: 'codex-cli-file', refreshWarning: refreshed.error }),
       route,
     };
   };
@@ -674,7 +731,11 @@ export function apply(ctx, rawConfig) {
         accountId: refreshed.accountId,
       },
     });
-    return { accountId: refreshed.accountId, expires: refreshed.expires, planType: refreshed.planType };
+    return {
+      accountId: refreshed.accountId,
+      expires: refreshed.expires,
+      ...(refreshed.planType === undefined ? {} : { planType: refreshed.planType }),
+    };
   };
 
   /**
@@ -747,6 +808,16 @@ export function apply(ctx, rawConfig) {
             lines.push(`- Codex CLI 登录：未找到（${cli.path}）`);
           }
           lines.push(`- openai-codex route：${value.route?.configured ? '已启用' : '未启用（调用 gpt_sign_in 时会自动补上）'}`);
+          if (value.route?.configured) {
+            // A route without the retry add-on stops the turn on the first
+            // malformed tool-call response; say so instead of leaving the user
+            // to rediscover it from a failure message.
+            lines.push(
+              value.route.retriesMalformed === true
+                ? '- 流式工具调用修复：已启用（按 id 纠正被复用位置的并行调用；参数无法解析时重试）'
+                : '- 流式工具调用修复：部分启用（按 id 纠正位置；参数无法解析时**不会**重试——调用 POST /gpt-codex/route/enable 可补上）',
+            );
+          }
           lines.push(`- 浏览器 OAuth 流：${value.flowAvailable ? '已注册，可在面板发起' : '未注册'}`);
           const probe = value.probe;
           if (probe !== undefined) {
@@ -826,11 +897,11 @@ export function apply(ctx, rawConfig) {
             source: 'codex-cli',
             accountId: facts.accountId,
             expires: facts.expires,
-            planType: facts.planType,
+            ...(facts.planType === undefined ? {} : { planType: facts.planType }),
             route: facts.route,
           };
         } catch (error) {
-          return { ok: false, provider: PROVIDER, error: error && error.message ? error.message : String(error) };
+          return { ok: false, provider: PROVIDER, error: typeof error?.message === 'string' ? error.message : String(error) };
         }
       },
     });
@@ -853,7 +924,7 @@ export function apply(ctx, rawConfig) {
           await store.deleteRecord(RECORD_KEY);
           return { ok: true };
         } catch (error) {
-          return { ok: false, error: error && error.message ? error.message : String(error) };
+          return { ok: false, error: typeof error?.message === 'string' ? error.message : String(error) };
         }
       },
     });
@@ -886,6 +957,16 @@ export function apply(ctx, rawConfig) {
   route(`${API_PREFIX}/status`, async (req, res) => {
     if (req.method !== 'GET') return sendJson(res, 405, { error: { message: 'GET only' } });
     sendJson(res, 200, await readStatus());
+  });
+
+  route(`${API_PREFIX}/stream-repair`, async (req, res) => {
+    if (req.method !== 'GET') return sendJson(res, 405, { error: { message: 'GET only' } });
+    sendJson(res, 200, {
+      ok: true,
+      version: STREAM_REPAIR_VERSION,
+      endpoints: resolveRepairEndpoints(settings.endpoints).map((endpoint) => ({ url: endpoint.url, dialect: endpoint.dialect })),
+      ...streamRepairStats,
+    });
   });
 
   /**
@@ -1089,14 +1170,23 @@ export function apply(ctx, rawConfig) {
     }, 'dsh-gpt-codex: enable route when a credential exists');
   }
 
-  // Put the proxy under pi-ai's *model* traffic too, not just this plugin's own
-  // requests — see installProcessProxy for why the process environment is the
-  // only lever that reaches the shipped adapter.
-  const restoreProxy = installProcessProxy(settings.proxy);
-  if (restoreProxy !== undefined) {
-    ctx.effect(() => restoreProxy, 'dsh-gpt-codex: proxy for the global fetch');
-    console.info(`[dsh-gpt-codex] 模型请求已走代理 ${settings.proxy}`);
+  if (settings.proxy !== undefined) {
+    ctx.effect(() => installProcessProxy(settings.proxy), 'dsh-gpt-codex: proxy for the global fetch');
+    console.info('[dsh-gpt-codex] 模型请求的运行时代理已启用');
   } else {
     console.info('[dsh-gpt-codex] 没有配置代理；模型请求将直连 auth.openai.com / chatgpt.com');
   }
+
+  // Installed last, so it wraps whatever `fetch` the proxy setup left behind
+  // rather than being replaced by it. pi-ai's model requests go through
+  // `globalThis.fetch` with no per-request override, which is why a fetch-level
+  // wrapper is the only place this repair can live without forking pi-ai.
+  const repairEndpointList = resolveRepairEndpoints(settings.endpoints);
+  ctx.effect(
+    () => installStreamRepair(globalThis, repairEndpointList, streamRepairStats),
+    'dsh-gpt-codex: tool-call identity repair for streamed responses',
+  );
+  console.info(
+    `[dsh-gpt-codex] 流式工具调用修复已启用（${repairEndpointList.length} 个端点，按 id 纠正被复用位置的并行调用）`,
+  );
 }

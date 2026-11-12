@@ -15,6 +15,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Even cases without an explicit scripted reply must stay offline (the bridge
+// may attempt a refresh before falling back to the fixture token).
+const realFetch = globalThis.fetch;
+globalThis.fetch = async () => { throw new Error('offline test: no scripted fetch reply'); };
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'gpt-codex-host-'));
 
@@ -389,7 +394,31 @@ console.log('dsh-gpt-codex host tests');
     await check('POST /sign-in adds a catalog-backed openai-codex route pinned to SSE', () => {
       const write = state.settingsWrites.find((entry) => entry.ns === 'llm-pi-ai');
       assert.ok(write, 'a settings write happened');
-      assert.deepEqual(write.ops, [{ op: 'set', path: ['providers', 'openai-codex'], value: { transport: 'sse' } }]);
+      // Two fields: the transport choice, and a retry policy that can recover
+      // from the malformed tool arguments a reused stream slot produces.
+      assert.deepEqual(write.ops, [{ op: 'set', path: ['providers', 'openai-codex'], value: {
+        transport: 'sse',
+        retryPolicy: {
+          mode: 'normal',
+          maxRetries: 2,
+          retryableCodes: ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'MALFORMED_RESPONSE'],
+        },
+      } }]);
+      assert.deepEqual(state.providers['openai-codex'], write.ops[0].value);
+    });
+  } finally {
+    net.restore();
+  }
+}
+
+// ---- 4b. retryMalformedResponses:false keeps the route at transport only
+{
+  const { ctx, state } = makeCtx();
+  apply(ctx, { codexAuthPath: codexAuthFile, retryMalformedResponses: false });
+  const net = installFetch([{ match: 'auth.openai.com/oauth/token', reply: tokenReply() }]);
+  try {
+    await request(state, 'POST', '/gpt-codex/sign-in', { mode: 'codex-cli' });
+    await check('the retry add-on can be turned off, leaving the single-field route', () => {
       assert.deepEqual(state.providers['openai-codex'], { transport: 'sse' });
     });
   } finally {
@@ -400,14 +429,47 @@ console.log('dsh-gpt-codex host tests');
 // ---- 5. an already-configured route is left alone
 {
   const { ctx, state } = makeCtx();
-  state.providers = { 'openai-codex': { transport: 'sse' } };
+  state.providers = { 'openai-codex': {
+    transport: 'sse',
+    retryPolicy: {
+      mode: 'normal',
+      maxRetries: 2,
+      retryableCodes: ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'MALFORMED_RESPONSE'],
+    },
+  } };
   apply(ctx, { codexAuthPath: codexAuthFile });
   const result = await request(state, 'POST', '/gpt-codex/route/enable', {});
   await check('an existing openai-codex route is not overwritten', () => {
     assert.equal(result.json.changed, false);
     assert.equal(result.json.reason, 'already-configured');
-    assert.deepEqual(state.providers['openai-codex'], { transport: 'sse' });
     assert.equal(state.settingsWrites.length, 0);
+  });
+}
+
+// ---- 5a2. a route an older version of this plugin wrote is upgraded in place
+{
+  const { ctx, state } = makeCtx();
+  state.providers = { 'openai-codex': { transport: 'sse' } };
+  apply(ctx, { codexAuthPath: codexAuthFile });
+  const result = await request(state, 'POST', '/gpt-codex/route/enable', {});
+  await check('a transport-only route left by an older version gains the retry add-on', () => {
+    assert.equal(result.json.changed, true);
+    assert.equal(result.json.reason, 'upgraded');
+    assert.equal(state.providers['openai-codex'].transport, 'sse');
+    assert.ok(state.providers['openai-codex'].retryPolicy.retryableCodes.includes('MALFORMED_RESPONSE'));
+  });
+}
+
+// ---- 5a3. a route with its own retry policy is not upgraded
+{
+  const { ctx, state } = makeCtx();
+  state.providers = { 'openai-codex': { transport: 'sse', retryPolicy: { mode: 'normal', maxRetries: 5, retryableCodes: ['SERVER'] } } };
+  apply(ctx, { codexAuthPath: codexAuthFile });
+  const result = await request(state, 'POST', '/gpt-codex/route/enable', {});
+  await check('a hand-written retry policy is respected verbatim', () => {
+    assert.equal(result.json.changed, false);
+    assert.equal(result.json.reason, 'already-configured-differently');
+    assert.deepEqual(state.providers['openai-codex'].retryPolicy, { mode: 'normal', maxRetries: 5, retryableCodes: ['SERVER'] });
   });
 }
 
@@ -945,5 +1007,34 @@ console.log('dsh-gpt-codex host tests');
   }
 }
 
+// ---- 29. the stream repair is mounted, configured and observable
+{
+  const { ctx, state } = makeCtx();
+  const before = globalThis.fetch;
+  // `makeCtx` never disposes, so restore the global by hand after the case.
+  apply(ctx, { codexAuthPath: codexAuthFile, endpoints: ['https://relay.test/openai/v1/chat/completions'] });
+  try {
+    const mounted = await request(state, 'GET', '/gpt-codex/stream-repair');
+    await check('GET /stream-repair names the endpoints and starts at zero', () => {
+      assert.equal(mounted.status, 200);
+      assert.equal(mounted.json.ok, true);
+      assert.equal(mounted.json.responses, 0);
+      assert.equal(mounted.json.repairedEvents, 0);
+      assert.deepEqual(mounted.json.endpoints.map((endpoint) => endpoint.url), [
+        'https://chatgpt.com/backend-api/codex/responses',
+        'https://relay.test/openai/v1/chat/completions',
+      ]);
+      assert.notEqual(globalThis.fetch, before, 'a wrapper is installed on the global fetch');
+    });
+    const wrongMethod = await request(state, 'POST', '/gpt-codex/stream-repair', {});
+    await check('the stream-repair route rejects the wrong method', () => {
+      assert.equal(wrongMethod.status, 405);
+    });
+  } finally {
+    globalThis.fetch = before;
+  }
+}
+
+globalThis.fetch = realFetch;
 await fsp.rm(tmp, { recursive: true, force: true });
 console.log(`\n${passed.length} checks passed`);

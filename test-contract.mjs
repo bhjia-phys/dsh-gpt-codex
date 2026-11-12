@@ -16,6 +16,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Force the bridge's refresh attempt to fail offline and use its fixture token.
+// Never contact the live token endpoint, even if the host has working networking.
+const realFetch = globalThis.fetch;
+globalThis.fetch = async () => { throw new Error('offline contract fixture'); };
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const passed = [];
 const check = async (label, fn) => {
@@ -215,7 +220,8 @@ await check('credentialStoreFrom().list() would report it as an oauth grant', ()
 
 // ---- the minimal route is valid under resolveRouteModels
 await check('the enabled route is the catalog-backed profile with SSE pinned', () => {
-  assert.deepEqual(state.providers, { 'openai-codex': { transport: 'sse' } });
+  const route = state.providers['openai-codex'];
+  assert.equal(route.transport, 'sse');
   // `resolveProfiles` treats every key on `profile` as optional, so this object
   // validates; `resolveRouteModels` substitutes the installed catalog because no
   // `models` list is configured.
@@ -226,13 +232,36 @@ await check('the enabled route is the catalog-backed profile with SSE pinned', (
     'streamIdleTimeoutMs', 'maxRequestImageBytes', 'requestImagePixelBudget', 'requestImageMaxBytes',
     'retryPolicy',
   ]);
-  for (const key of Object.keys(state.providers['openai-codex'])) {
+  for (const key of Object.keys(route)) {
     assert.ok(allowed.has(key), `unexpected route field ${key}`);
   }
   // `transport` is one of the four the schema accepts; `api` is deliberately
   // absent because hand-declaring `openai-codex-responses` is refused.
-  assert.deepEqual(['sse', 'websocket', 'websocket-cached', 'auto'].includes(state.providers['openai-codex'].transport), true);
-  assert.equal('api' in state.providers['openai-codex'], false, 'api must stay catalog-owned');
+  assert.deepEqual(['sse', 'websocket', 'websocket-cached', 'auto'].includes(route.transport), true);
+  assert.equal('api' in route, false, 'api must stay catalog-owned');
+});
+
+// ---- the retry policy is one the shipped schema and resolver accept
+await check('the retry policy matches RetryPolicySchema and resolveRetryPolicy', () => {
+  const policy = state.providers['openai-codex'].retryPolicy;
+  // `normalPolicySchema` requires `mode: 'normal'`; `resolveRetryPolicy`
+  // (dsh-llm/lib/index.js:365-395) additionally refuses unknown keys, a
+  // fractional or negative `maxRetries`, an empty code list, and any code that
+  // is not a non-empty string.
+  assert.equal(policy.mode, 'normal');
+  assert.ok(Number.isSafeInteger(policy.maxRetries) && policy.maxRetries >= 0);
+  assert.ok(policy.retryableCodes.length > 0);
+  assert.deepEqual(Object.keys(policy).sort(), ['maxRetries', 'mode', 'retryableCodes']);
+  for (const code of policy.retryableCodes) assert.ok(typeof code === 'string' && code.length > 0);
+  // Every code must be one `LLM_FAILURE_CODES` publishes as a `retryChoice`, or
+  // the settings form would show it verbatim as a custom code.
+  const choices = new Set(['EMPTY_RESPONSE', 'MALFORMED_RESPONSE', 'QUOTA', 'RATE_LIMIT', 'SERVER', 'STREAM_CLOSED', 'TIMEOUT', 'TRANSPORT']);
+  for (const code of policy.retryableCodes) assert.ok(choices.has(code), `${code} is a published retry choice`);
+  // The five defaults are kept, so transient failures behave as before.
+  for (const code of ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']) {
+    assert.ok(policy.retryableCodes.includes(code), `${code} stays retried`);
+  }
+  assert.ok(policy.retryableCodes.includes('MALFORMED_RESPONSE'), 'the code a reused slot produces is retried');
 });
 
 // ---- the installed catalog actually describes this route
@@ -252,10 +281,13 @@ await check('the installed pi-ai catalog serves chat models for openai-codex', a
     const header = Buffer.alloc(16);
     await handle.read(header, 0, 16, 0);
     const headerSize = header.readUInt32LE(12);
+    // Content starts at `8 + framing.readUInt32LE(4)`, the header pickle's own
+    // size including its length field. `16 + headerSize` is short by the JSON
+    // padding (0-3 bytes) and prepends each file with its predecessor's tail.
+    const base = 8 + header.readUInt32LE(4);
     const raw = Buffer.alloc(headerSize);
     await handle.read(raw, 0, headerSize, 16);
     const index = JSON.parse(raw.toString('utf8').replace(/\0+$/, ''));
-    const base = 16 + headerSize;
     const target = '/dsh/node_modules/@earendil-works/pi-ai/dist/providers/data/openai-codex.json';
     const walk = (node, prefix) => {
       for (const [name, entry] of Object.entries(node.files ?? {})) {
@@ -295,5 +327,6 @@ await check('webServer is the only declared hard dependency', () => {
   assert.deepEqual([...inject], ['webServer']);
 });
 
+globalThis.fetch = realFetch;
 await fsp.rm(tmp, { recursive: true, force: true });
 console.log(`\n${passed.length} checks passed`);

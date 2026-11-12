@@ -25,7 +25,7 @@
 ```bash
 git clone https://github.com/bhjia-phys/dsh-gpt-codex.git
 cd dsh-gpt-codex
-npm test          # 43 项离线测试，不联网、不碰真实凭据
+npm test          # 96 项检查 + 本机代理回归，不访问外网、不碰真实凭据
 ```
 
 安装到某个 DSH profile（以 `desktop` 为例）：
@@ -79,7 +79,7 @@ npm test          # 43 项离线测试，不联网、不碰真实凭据
 
 更麻烦的是：Node 的全局 `fetch` **默认忽略** `HTTP(S)_PROXY`，除非进程启动时就设了 `NODE_USE_ENV_PROXY=1`——已经跑起来的桌面版无法补上这个变量。
 
-所以插件自己解析代理并给每个请求挂显式 `dispatcher`：`proxy` 配置 > `HTTPS_PROXY`/`HTTP_PROXY` > 直连。在 `cordis.patch.yml` 里写：
+所以插件自己解析代理，并在加载时调用 Node.js 24.14+ 的 `http.setGlobalProxyFromEnv()`，立即重建全局 `fetch` dispatcher；卸载时恢复旧 dispatcher 和 agents，不修改进程环境变量。本机回环请求绕过代理，已有 `NO_PROXY` 配置继续保留。仅在运行中设置 `NODE_USE_ENV_PROXY=1` 不会重建已初始化的 dispatcher，可能出现「日志显示已走代理，实际聊天仍然 fetch failed」。代理选择顺序是 `proxy` 配置 > `HTTPS_PROXY`/`HTTP_PROXY` > 直连。在 `cordis.patch.yml` 里写：
 
 ```yaml
 - id: gpt-codex
@@ -109,12 +109,15 @@ npm test          # 43 项离线测试，不联网、不碰真实凭据
 | `gpt_sign_in` | `mode: 'codex-cli'`（默认）桥接；`mode: 'browser'` 会如实拒绝，因为需要人工交互 |
 | `gpt_sign_out` | 删除本机记录（不向 OpenAI 撤销，也不动 Codex CLI 自己的登录） |
 
+工具直接返回纯 JSON：未知的 `planType`、`authMode`、凭据字段及不存在的 `bridgeError` 会被结构化省略，而不是返回 `undefined`；`verify: false` 不含 `probe`。时间戳只输出有限数值；异常 JWT/刷新响应的到期值沿用缺少到期值时的当前时间回退，已存记录中的非有限到期值不输出。工具边界不靠 `JSON.stringify` 静默清理非法值。
+
 ## HTTP 路由
 
 客户端半只能走同源 `fetch`（client bundle 里没有 `host`、没有 fs、没有 `ctx.remote` 的自定义命名空间）：
 
 ```
 GET  /gpt-codex/status
+GET  /gpt-codex/stream-repair          # 修复安装了哪些端点、改写过多少条事件
 POST /gpt-codex/sign-in        { mode: 'codex-cli' }
 POST /gpt-codex/sign-out
 POST /gpt-codex/oauth/start
@@ -134,8 +137,60 @@ Cordis patch 对匹配到的条目是**整段替换**、不深合并（`dsh-app-
 - 不写 `apiKeyEnv` → 走 pi-ai 自己的 OAuth credential store（即 `llm-pi-ai/openai-codex`）
 - **不要**手写 `api: openai-codex-responses`：`supportedProtocols()` 只允许 openai-completions / openai-responses / anthropic-messages；catalog route 不写 `api` 才会复用 codex 实现
 - **`transport: 'sse'` 是规避一个官方缺陷**：pi-ai 的 Codex WebSocket 缓存把 socket 连同 idle timer 留在模块级 Map 里，而这个版本里 `cleanupSessionResources` **零调用方**——没人调 `closeOpenAICodexWebSocketSessions`。结果是 WebSocket 那一轮答完之后事件循环不空，桌面版上表现为「回答完了但请求不收尾」。`auto` 可能选中 WebSocket，因此继承这个问题。上游 AITP fork 撞到同一件事，最后也把 SSE 定成默认。这只是传输选择，协议本身没变。
+- 0.2.0 起 route 还带一条 `retryPolicy`，见下一节。
 
-如果你自己已经配置了 `openai-codex`（换 transport、钉模型列表、改 endpoint），插件**不会覆盖**：它会报 `already-configured-differently` 然后放着不动。
+如果你自己已经配置了 `openai-codex`（换 transport、钉模型列表、改 endpoint），插件**不会覆盖**：它会报 `already-configured-differently` 然后放着不动。唯一的例外是「只有 `transport: 'sse'`、别的字段一个都没有」——那是 0.1.0 自己写的形状，会被就地补成当前的 route（`reason: 'upgraded'`）。
+
+## 并行工具调用被合并：`Unexpected non-whitespace character after JSON`
+
+**症状**（2026-11-12 在另一台机器上复现）：一轮里连着发两个 `grep`，整轮直接失败，面板上显示
+
+```
+本轮运行失败  Tool call "grep": Unexpected non-whitespace character after JSON at position 186
+(line 1 column 187) Received arguments: {"pattern": "apiKeyEnv|openai-api-key|API key|nativeAuth", ...}{"pattern": "supportedProtocols|apiKeyEnv|...", ...}
+MALFORMED_RESPONSE
+```
+
+`position 186` 正好是**第一条**调用的参数串长度（`'{"pattern": "apiKeyEnv|…README.md"}'` 就是 186 个字符）。也就是说两条调用的参数被拼进了同一个缓冲区。
+
+**根因不在插件，在 pi-ai 1.3.0 的两处定位逻辑**：
+
+- Responses 路径按 `output_index` 建槽（`openai-responses-shared.js` 的 `outputSlots` / `getSlot`），
+- chat-completions 路径按 `tool_calls[].index` 建块（`openai-completions.js` 的 `toolCallBlocksByIndex`）。
+
+两者都只用**位置**、不用 `item_id` / `id`。网关只要把两个并行调用放进同一个 `output_index`，两条参数文本就累加进同一块，最后按一个 JSON 解析 → 在第一条末尾的位置报 `Unexpected non-whitespace character`。适配器把它变成 `MALFORMED_RESPONSE`（`dsh-llm-pi-ai/src/stream.ts:210-231`），而这个码**不在默认重试集里**（`dsh-llm` 默认只重试 EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT），所以本轮第一次尝试就结束——「失败之后就不动了」正是这么来的。
+
+**修法（0.2.0）**分两层：
+
+1. `stream-repair.js` 在 fetch 层把 SSE 帧里的 `output_index` / `tool_calls[].index` 按 **id** 重新分配：**服务器宣告过的** 调用落到同一个位置时换一个空位，同一 id 的后继分片跟着它走。请求体、凭据、其他 URL 一律不碰；只有真的改写了位置字段的帧才重新编码，其余字节原样透传。
+2. route 的 `retryPolicy` 把 `MALFORMED_RESPONSE` 加进重试码（`maxRetries: 2`）。这一层兜住切不开的坏数据，也兜住下面那条刻意不修的情形。
+
+`GET /gpt-codex/stream-repair` 会报出装了哪些端点、改写过多少条事件：
+
+```json
+{ "ok": true, "version": "0.2.0", "responses": 3, "repairedEvents": 1,
+  "endpoints": [{ "url": "https://chatgpt.com/backend-api/codex/responses", "dialect": "responses" }] }
+```
+
+`repairedEvents > 0` 说明你的网关确实在复用位置；`responses > 0` 但一直是 0，说明这条链路是干净的。
+
+**刻意不修、留给重试的情形**（都会如实失败，不会变成「静默少一个调用」）：
+
+- 分片里**完全没有 id** —— 没有可归属的依据。
+- 只有参数分片、服务器从没 `output_item.added` 宣告过这个调用 —— 把它挪到新位置，解析器那边没有对应的 block，这个调用会被静默丢掉。宁可让这一轮失败并让重试重问，也不要给出一个错的答复。参数串里确实含两个 JSON 对象（`{"a":1}{"a":2}`）同属这一类。
+
+**换到中转站**（route 的 `baseURL` 不是 Codex 后端）时，端点要显式告诉插件，否则 fetch 层不会碰它：
+
+```yaml
+- id: gpt-codex
+  name: 'dsh-gpt-codex'
+  config:
+    proxy: 'http://127.0.0.1:7897'
+    endpoints:
+      - https://relay.example.com/openai/v1/responses                        # Responses 协议
+      - { url: 'https://relay.example.com/v1/chat/completions', dialect: completions }
+    retryMalformedResponses: true   # 设 false 则 route 只留 transport
+```
 
 ## 安装
 
@@ -154,18 +209,25 @@ Cordis patch 对匹配到的条目是**整段替换**、不深合并（`dsh-app-
     - id: gpt-codex
       name: 'dsh-gpt-codex'
       config:
-        codexAuthPath: ''      # 空 = $CODEX_HOME 或 ~/.codex
-        autoEnableRoute: true  # 已有凭据时自动补上 openai-codex route
+        codexAuthPath: ''              # 空 = $CODEX_HOME 或 ~/.codex
+        autoEnableRoute: true          # 已有凭据时自动补上 openai-codex route
+        retryMalformedResponses: true  # route 的重试码加上 MALFORMED_RESPONSE
+        endpoints: []                  # 中转站的流式端点（见上一节）
 ```
 
 ## 测试
 
 ```bash
-node test-host.mjs      # 36 项：桥接、route 启用、OAuth 状态机、工具、路由、客户端包形态、slot 契约、刷新自愈、真实探测
-node test-contract.mjs  #  7 项：record 是否能通过真实 store 的准入规则；与已安装 pi-ai 目录交叉验证
+node test-host.mjs          # 41 项：桥接、route 启用/升级、OAuth 状态机、工具、路由、客户端包形态、刷新自愈、真实探测
+node test-contract.mjs      #  8 项：record 能否通过真实 store 的准入规则；retryPolicy 是否被 schema 接受；与已安装目录交叉验证
+node test-json.mjs          # 31 项：直接 execute/render 的 lossless JSON 边界；成功/失败、缺字段、异常时间戳
+node test-proxy.mjs         # 本地代理回归：先初始化 fetch，再加载插件；检查代理生效、回环绕过与卸载恢复
+node test-stream-repair.mjs # 16 项：用**已安装的 pi-ai** 重放「两个调用挤在一个 output_index」，直到 stream() 端到端
 ```
 
-两个测试都不联网、不发起真实 OAuth、不碰真实凭据库（用替身），`test-contract.mjs` 会从已安装的 `app.asar` 里读出真实的 `openai-codex` 目录做交叉验证。
+`test-stream-repair.mjs` 不是对着本仓库自己的假设打转：它从 `app.asar` 里解出真实的 `openai-responses-shared.js` 跑，先证明未修复时确实报出 `…after JSON at position 186`，再证明修复后两个调用都能解析。找不到应用时这一组跳过（可用 `DSH_ASAR` 指定路径）。
+
+这些测试不访问外网、不发起真实 OAuth、不碰真实凭据库；代理回归只启动本机测试服务。其余测试用替身，未配置的 fetch 也被离线拦截；`test-contract.mjs` 会从已安装的 `app.asar` 里读出真实的 `openai-codex` 目录做交叉验证。`test-json.mjs` 递归检查原始工具返回值和渲染块，拒绝 undefined、非有限数、负零、稀疏数组、循环及非普通对象，再核对 JSON 往返不丢信息，避免 HTTP 序列化先吞掉问题。
 
 ## 已知边界
 
@@ -174,6 +236,8 @@ node test-contract.mjs  #  7 项：record 是否能通过真实 store 的准入�
 - **面板里的浏览器登录依赖 Host 进程存活**；页面刷新会丢掉进行中的 attempt。
 - **Codex CLI 那条路只有在 `auth_mode: chatgpt` 时可用**；`auth_mode: apikey` 会被明确拒绝（不会悄悄搬一个错误形状进去）。
 - pi-ai 的 `originator` 头默认是 `"pi"`。若后端策略要求别的值，需要在 pi-ai 上游改，插件层碰不到。
+- **流式修复只覆盖 SSE。** WebSocket 那一路不经过 `fetch`，位置复用问题在那里修不了；插件把 route 钉在 SSE 上，正是为了让它自己的修复有机会生效。
+- **重试是「再花一次订阅额度」。** `retryMalformedResponses` 打开后，一次坏响应会重问最多 2 次；这是刻意的取舍，不是白拿。
 
 ## 更多文档
 
@@ -183,13 +247,13 @@ node test-contract.mjs  #  7 项：record 是否能通过真实 store 的准入�
 
 ## 贡献
 
-两个测试是唯一的准入门槛：
+运行完整测试：
 
 ```bash
 npm test
 ```
 
-它们刻意不联网、不碰真实凭据，所以任何人在任何机器上都能跑。`test-contract.mjs` 会尝试从已安装的 DeepSeek Harness 里读真实目录做交叉验证；找不到应用时自动跳过（可用 `DSH_ASAR` 指定路径）。
+测试不访问外网、不碰真实凭据；代理回归要求 Node.js 24.14+。`test-contract.mjs` 会尝试从已安装的 DeepSeek Harness 里读真实目录做交叉验证；找不到应用时自动跳过（可用 `DSH_ASAR` 指定路径）。
 
 ## 许可
 

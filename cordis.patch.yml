@@ -12,14 +12,22 @@
 #                      Empty means $CODEX_HOME or ~/.codex.
 # proxy:               HTTP(S) proxy for auth.openai.com and chatgpt.com.
 #                      Empty means fall back to HTTPS_PROXY/HTTP_PROXY, then
-#                      direct. The plugin also sets NODE_USE_ENV_PROXY=1 for the
-#                      process, because Node's global fetch ignores those
-#                      variables otherwise — and pi-ai's model requests go
-#                      through that global fetch. Set this whenever the app
-#                      cannot reach OpenAI directly.
+#                      direct. On Node >= 24.14 the plugin rebuilds the global
+#                      fetch dispatcher at load time and restores it on unload.
+#                      Loopback requests bypass the proxy. Set this whenever
+#                      the app cannot reach OpenAI directly.
 # autoEnableRoute:     add the openai-codex provider route automatically once a
 #                      ChatGPT credential exists. Set false to configure it by
 #                      hand.
+# endpoints:           extra stream endpoints whose tool-call slots this plugin
+#                      repairs, when the route points at a relay instead of the
+#                      Codex backend. Strings are Responses streams; use
+#                      `{ url, dialect: completions }` for a chat-completions one.
+# retryMalformedResponses:
+#                      add `MALFORMED_RESPONSE` to the route's retry codes (2
+#                      retries). Recovers the turn when a response's tool
+#                      arguments cannot be parsed at all. Set false to keep the
+#                      route profile at `transport` only.
 
 - insert:
     - id: gpt-codex
@@ -28,3 +36,5 @@
         codexAuthPath: ''
         proxy: 'http://127.0.0.1:7897'
         autoEnableRoute: true
+        retryMalformedResponses: true
+        endpoints: []
