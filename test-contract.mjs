@@ -167,6 +167,51 @@ async function request(state, method, url, body) {
   return { status: res.statusCode, json: JSON.parse(String(await ended)) };
 }
 
+/**
+ * Read one file out of the installed `app.asar`.
+ *
+ * An asar is a header-prefixed archive: a 16-byte pickled header (payload size at
+ * offset 12), then a JSON index whose file entries carry `offset` (relative to the
+ * end of the header) and `size`. Reading at the header's own offsets is what makes
+ * this reliable — scanning for JSON in the raw bytes finds unrelated payloads.
+ *
+ * @returns the file's text, or `undefined` when the app (or the file) is absent.
+ */
+async function readAsarFile(asarRelativePath) {
+  const asar = process.env.DSH_ASAR ?? defaultAsarPath();
+  const exists = asar === undefined ? false : await fsp.stat(asar).then(() => true).catch(() => false);
+  if (!exists) return undefined;
+  const handle = await fsp.open(asar, 'r');
+  try {
+    const header = Buffer.alloc(16);
+    await handle.read(header, 0, 16, 0);
+    const headerSize = header.readUInt32LE(12);
+    const raw = Buffer.alloc(headerSize);
+    await handle.read(raw, 0, headerSize, 16);
+    const index = JSON.parse(raw.toString('utf8').replace(/\0+$/, ''));
+    const base = 16 + headerSize;
+    const walk = (node, prefix) => {
+      for (const [name, entry] of Object.entries(node.files ?? {})) {
+        const full = `${prefix}/${name}`;
+        if (entry.files) {
+          const found = walk(entry, full);
+          if (found) return found;
+        } else if (full === asarRelativePath) {
+          return entry;
+        }
+      }
+      return undefined;
+    };
+    const entry = walk(index, '');
+    if (entry === undefined) return undefined;
+    const buffer = Buffer.alloc(Number(entry.size));
+    await handle.read(buffer, 0, Number(entry.size), base + Number(entry.offset));
+    return buffer.toString('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
 const { apply, inject } = await import('./index.js');
 
 console.log('dsh-gpt-codex upstream contract');
@@ -241,53 +286,69 @@ await check('the installed pi-ai catalog serves chat models for openai-codex', a
   // copy: this is the fact the whole plugin leans on. The location is discovered
   // from the environment so the check runs on any machine, and it skips cleanly
   // when the app is absent.
-  const asar = process.env.DSH_ASAR ?? defaultAsarPath();
-  const exists = asar === undefined ? false : await fsp.stat(asar).then(() => true).catch(() => false);
-  if (!exists) {
+  const source = await readAsarFile('/dsh/node_modules/@earendil-works/pi-ai/dist/providers/data/openai-codex.json');
+  if (source === undefined) {
     console.log('  --  installed app not found (set DSH_ASAR to point at app.asar); skipping the catalog cross-check');
     return;
   }
-  const handle = await fsp.open(asar, 'r');
-  try {
-    const header = Buffer.alloc(16);
-    await handle.read(header, 0, 16, 0);
-    const headerSize = header.readUInt32LE(12);
-    const raw = Buffer.alloc(headerSize);
-    await handle.read(raw, 0, headerSize, 16);
-    const index = JSON.parse(raw.toString('utf8').replace(/\0+$/, ''));
-    const base = 16 + headerSize;
-    const target = '/dsh/node_modules/@earendil-works/pi-ai/dist/providers/data/openai-codex.json';
-    const walk = (node, prefix) => {
-      for (const [name, entry] of Object.entries(node.files ?? {})) {
-        const full = `${prefix}/${name}`;
-        if (entry.files) {
-          const found = walk(entry, full);
-          if (found) return found;
-        } else if (full === target) {
-          return entry;
-        }
-      }
-      return undefined;
-    };
-    const entry = walk(index, '');
-    assert.ok(entry, 'the openai-codex catalog file is installed');
-    const buffer = Buffer.alloc(Number(entry.size));
-    await handle.read(buffer, 0, Number(entry.size), base + Number(entry.offset));
-    const catalog = JSON.parse(buffer.toString('utf8'));
-    const models = Object.values(catalog['openai-codex-responses'] ?? {});
-    assert.ok(models.length > 0, 'the catalog lists chat models');
-    for (const model of models) {
-      assert.equal(model.type, 'chat');
-      assert.equal(model.provider, 'openai-codex');
-      assert.equal(model.baseUrl, 'https://chatgpt.com/backend-api');
-      assert.equal(model.api, 'openai-codex-responses');
-    }
-    // An empty route profile inherits all of these, so the plugin never has to
-    // restate a model list that would drift from the installed catalog.
-    assert.ok(models.some((model) => model.id === 'gpt-6.1-sol'), 'the Ace model AITP used upstream is present');
-  } finally {
-    await handle.close();
+  const catalog = JSON.parse(source);
+  const models = Object.values(catalog['openai-codex-responses'] ?? {});
+  assert.ok(models.length > 0, 'the catalog lists chat models');
+  for (const model of models) {
+    assert.equal(model.type, 'chat');
+    assert.equal(model.provider, 'openai-codex');
+    assert.equal(model.baseUrl, 'https://chatgpt.com/backend-api');
+    assert.equal(model.api, 'openai-codex-responses');
   }
+  // An empty route profile inherits all of these, so the plugin never has to
+  // restate a model list that would drift from the installed catalog.
+  assert.ok(models.some((model) => model.id === 'gpt-6.1-sol'), 'the Ace model AITP used upstream is present');
+});
+
+// ---- the profile schema admits the API-key route exactly as written
+await check('the openai route profile validates against the shipped pi-ai schema', async () => {
+  // The API-key half leans on a different upstream fact than the subscription
+  // half: `openai` is a *catalog* provider with its own apiKey auth, so declaring
+  // it needs only `apiKeyEnv` (and may omit `api`/`baseURL`/`models`). This reads
+  // the shipped schema and the shipped catalog entry to prove both halves.
+  const llm = await readAsarFile('/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js');
+  if (llm === undefined) {
+    console.log('  --  installed app not found; skipping the profile-schema cross-check');
+    return;
+  }
+  const catalog = JSON.parse(
+    (await readAsarFile('/dsh/node_modules/@earendil-works/pi-ai/dist/providers/data/openai.json')) ?? '{}',
+  );
+  const { ctx, state } = makeCtx();
+  apply(ctx, { codexAuthPath: codexAuthFile });
+  await request(state, 'POST', '/gpt-codex/api-key/route');
+  const profile = state.providers?.openai;
+  assert.ok(profile, 'the plugin declared the openai route');
+  // Every field is one `resolveProfiles` accepts; anything else would be dropped
+  // silently, which is worse than a loud failure.
+  const allowed = new Set([
+    'apiKeyEnv', 'displayName', 'api', 'baseURL', 'models', 'modelOverrides', 'compat',
+    'defaultContextWindow', 'defaultMaxTokens', 'defaultInput', 'headers', 'reasoning',
+    'thinkingBudgets', 'cacheRetention', 'transport', 'timeoutMs', 'websocketConnectTimeoutMs',
+    'streamIdleTimeoutMs', 'maxRequestImageBytes', 'requestImagePixelBudget', 'requestImageMaxBytes',
+    'retryPolicy',
+  ]);
+  for (const key of Object.keys(profile)) assert.ok(allowed.has(key), `unexpected route field ${key}`);
+  // `apiKeyEnv` must satisfy the credential-reference grammar the seam enforces.
+  assert.match(profile.apiKeyEnv, /^[A-Za-z_][A-Za-z0-9_]*$/);
+  // `api` stays catalog-owned: hand-declaring `openai-responses` is legal, but
+  // pinning it would stop the route from following the installed catalog.
+  assert.equal('api' in profile, false);
+  // The catalog really does carry api-key auth for `openai`, which is why storing
+  // a key under the reference is enough to authenticate the route.
+  assert.ok(catalog['openai-responses'], 'the installed catalog describes openai chat models');
+  const first = Object.values(catalog['openai-responses'])[0];
+  assert.equal(first.provider, 'openai');
+  assert.equal(first.baseUrl, 'https://api.openai.com/v1');
+  assert.equal(first.api, 'openai-responses');
+  // And the schema's route profile names `apiKeyEnv` as a credential reference,
+  // so the Harness — not the plugin — resolves the secret.
+  assert.match(llm, /apiKeyEnv:\s*z\.string\(\)\.role\("credential-ref"\)/);
 });
 
 // ---- the plugin's hard dependency is the only service it cannot do without

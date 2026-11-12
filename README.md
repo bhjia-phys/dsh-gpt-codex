@@ -1,8 +1,11 @@
-# dsh-gpt-codex — 用 ChatGPT 订阅驱动 DeepSeek Harness 桌面版
+# dsh-gpt-codex — 用 ChatGPT 订阅或 OpenAI API key 驱动 DeepSeek Harness 桌面版
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-这个插件补上桌面版 0.2.1-rc.5 里唯一缺的那一块：让你**用 ChatGPT 订阅（而不是 API key）跑 GPT**。
+这个插件把 GPT 接进桌面版，**两条独立的计费与鉴权路线各走各的**：
+
+- **ChatGPT 订阅**（OAuth 登录，走 `chatgpt.com/backend-api`，用你的订阅额度）
+- **OpenAI API key**（`sk-…`，走 `api.openai.com`，按量计费）
 
 底层东西其实官方都已经装好了，本插件不重复实现：
 
@@ -10,22 +13,24 @@
 |---|---|
 | pi-ai 适配器（dormant，零 route） | `@deepseek-ai/dsh-llm-pi-ai`，随 `dsh-base` 挂载 |
 | `openai-codex` provider，`https://chatgpt.com/backend-api`，9 个 chat 模型 | `@earendil-works/pi-ai` 1.1.0 |
+| `openai` provider，`https://api.openai.com/v1`，40+ 个 chat 模型，自带 apiKey 鉴权 | 同上 |
 | ChatGPT OAuth 授权流（`llm-pi-ai/openai-codex`） | `dsh-llm-pi-ai` 的 `registerPiAiFlows` |
 | 凭据落盘与跨进程刷新 | `dsh-credentials-local` → `~/.dsh/.credentials.yaml` |
 
-**缺的只有两件事**，也正是本插件的全部内容：
+**缺的只有这几件事**，也正是本插件的全部内容：
 
 1. **没人能触发那条 OAuth 流。** 全应用里 `authorization.begin()` 的唯一调用方是 DeepSeek 账号插件；Models 页面对 `openai-codex`（`env: []` + `oauth: true` 的 keyless native auth）**连 API key 输入框都不渲染**，`settings.models.sign-in` 又被 DeepSeek 首次引导占着。所以界面上根本没有登录入口。
 2. **`llm-pi-ai` 没有 `openai-codex` 这条 route**，即使有凭据也不服务任何模型。
+3. **`llm-pi-ai` 也没有 `openai` 这条 route**，所以就算在 Models 页填了 `OPENAI_API_KEY`，也没有任何 provider 会去用它。
 
-> 换句话说：官方并不缺 GPT 适配器，缺的是**触发登录的入口**和**一条 route**。这个插件只补这两处，不重写适配器。
+> 换句话说：官方并不缺 GPT 适配器，缺的是**触发登录的入口**和**两条 route**。这个插件只补这几处，不重写适配器。
 
 ## 快速开始
 
 ```bash
 git clone https://github.com/bhjia-phys/dsh-gpt-codex.git
 cd dsh-gpt-codex
-npm test          # 43 项离线测试，不联网、不碰真实凭据
+npm test          # 58 项离线测试，不联网、不碰真实凭据
 ```
 
 安装到某个 DSH profile（以 `desktop` 为例）：
@@ -38,7 +43,7 @@ npm test          # 43 项离线测试，不联网、不碰真实凭据
 
 把包链接进 profile 的 `node_modules/`（非 scoped 包直接放顶层），重启桌面版，然后打开 **设置 → GPT 接入**。
 
-## 两种登录方式
+## 三条接入方式
 
 ### A. 复用已有的 Codex CLI 登录（推荐，最快）
 
@@ -58,6 +63,19 @@ npm test          # 43 项离线测试，不联网、不碰真实凭据
 3. device code：给出验证码与 `https://auth.openai.com/codex/device`
 
 面板会实时显示 URL、验证码和待回答问题。**登录尝试不可跨页面刷新恢复**（授权 seam 不持久化 attempt），刷新页面就得重来。
+
+### C. OpenAI Platform API key（不需要订阅）
+
+填一个 `sk-…`，插件把它写进 Harness 的凭据库（reference `OPENAI_API_KEY`，与「设置 → 模型」里填的是**同一个值**），再启用 `llm-pi-ai` 的 `openai` route —— 那是一条**目录里本来就有、但没人声明**的 route：`api.openai.com/v1`、自带 `apiKey` 鉴权、40+ 个 chat 模型。
+
+为什么 key 不能塞进 `openai-codex` 那条 route？两条硬约束，都在 pi-ai 内部：
+
+1. `openai-codex-responses` 必须先解出 `chatgpt-account-id` 再发请求，而它的 `extractAccountId(token)` 用 `token.split(".")` 拆 JWT。`sk-…` 不是 JWT，长度不等于 3 → 直接抛 `Failed to extract accountId from token`。
+2. 那个后端是 `https://chatgpt.com/backend-api`，语义就是"订阅账号的代发端点"，不是 Platform 计费端点。
+
+反过来，`openai` 那条 route 天生就区分两者：`pi-ai/dist/api/openai-responses.js` 的 `isChatGPTSignIn(model, apiKey)` 用 **`!apiKey.startsWith("sk-")`** 判断要不要走订阅语义 —— 即 `sk-` 开头就是标准 Platform 鉴权。所以这两条路线在 pi-ai 里本来就是分开设计的，插件只负责把它们各自接上。
+
+面板：**设置 → GPT 接入 → OpenAI API key（按量计费）**，可以保存（存完自动启用 route 并验证）、单独启用 route、验证、删除。**key 永不回显**，返回给面板的只有「已保存 / project 还是 user key / 来源」。
 
 ## 两个必须知道的实测事实
 
@@ -94,20 +112,22 @@ npm test          # 43 项离线测试，不联网、不碰真实凭据
 
 两个入口：
 
-1. **设置 → GPT 接入**（`settings.section`，`id: gpt-codex`）：完整生命周期。显示凭据状态与到期时间、ChatGPT 账号、Codex CLI 登录是否可复用、route 是否启用、OAuth 流是否可用；按钮：复用 Codex CLI 登录 / 浏览器登录 / 仅启用 route / **验证能否用** / **刷新 token** / 登出。
-2. **设置 → 模型 → `openai-codex` 那一行的卡片内**（`settings.models.provider-card`）：就在用户本来要找 provider 配置的地方，给一个「复用 Codex CLI 登录」按钮。
+1. **设置 → GPT 接入**（`settings.section`，`id: gpt-codex`）：完整生命周期。三张卡片 —— 订阅凭据（状态与到期时间、ChatGPT 账号、Codex CLI 登录是否可复用、route 是否启用、OAuth 流是否可用）、**OpenAI API key**（已保存与否、reference、`openai` route 状态、保存/启用/验证/删除）、以及两个共同的动作区。订阅侧的按钮：复用 Codex CLI 登录 / 浏览器登录 / 仅启用 route / **验证能否用** / **刷新 token** / 登出。
+2. **设置 → 模型** 里那一行的卡片内（`settings.models.provider-card`）：`openai-codex` 行给「复用 Codex CLI 登录」按钮，`openai` 行说明这条 provider 要的是 API key、并指向上面那张卡片。
 
 > 第 2 个入口有个坑值得记下来：`settings.models.provider-card` 是 **keyed** slot，渲染器按 `options.key === entryKey` 解析（`dsh-client-ui-renderer/lib/client.js:1179`），而 Models 页传入的 `entryKey` 是 `row.entry.settingsNs` —— pi-ai 家族即 `"llm-pi-ai"`。key 写成别的值不会报错，只是**静默不渲染**。测试里专门钉了这条契约。
 
 ## Agent 工具
 
-模型自己也能操作这三件事：
+模型自己也能操作这些事：
 
 | 工具 | 作用 |
 |---|---|
-| `gpt_status` | 凭据、Codex CLI 可复用性、route 状态，默认发一次真实请求确认可用（`verify: false` 可跳过） |
+| `gpt_status` | 两条路线的完整状态，默认发一次真实请求确认订阅可用（`verify: false` 可跳过）；同时报 API key 的有无与 `openai` route 状态 |
 | `gpt_sign_in` | `mode: 'codex-cli'`（默认）桥接；`mode: 'browser'` 会如实拒绝，因为需要人工交互 |
 | `gpt_sign_out` | 删除本机记录（不向 OpenAI 撤销，也不动 Codex CLI 自己的登录） |
+| `gpt_set_api_key` | 保存 Platform key、启用 `openai` route，并默认真的打一次 `api.openai.com/v1/models` 验证 |
+| `gpt_clear_api_key` | 删除本机保存的 API key（不影响订阅凭据） |
 
 ## HTTP 路由
 
@@ -122,6 +142,12 @@ POST /gpt-codex/oauth/answer   { value }
 POST /gpt-codex/oauth/cancel
 GET  /gpt-codex/oauth/state
 POST /gpt-codex/route/enable
+
+GET  /gpt-codex/api-key/status
+POST /gpt-codex/api-key        { apiKey, verify? }
+DEL  /gpt-codex/api-key
+GET  /gpt-codex/api-key/verify
+POST /gpt-codex/api-key/route
 ```
 
 ## 为什么 route 走 settings 而不是 bundle patch
@@ -136,6 +162,16 @@ Cordis patch 对匹配到的条目是**整段替换**、不深合并（`dsh-app-
 - **`transport: 'sse'` 是规避一个官方缺陷**：pi-ai 的 Codex WebSocket 缓存把 socket 连同 idle timer 留在模块级 Map 里，而这个版本里 `cleanupSessionResources` **零调用方**——没人调 `closeOpenAICodexWebSocketSessions`。结果是 WebSocket 那一轮答完之后事件循环不空，桌面版上表现为「回答完了但请求不收尾」。`auto` 可能选中 WebSocket，因此继承这个问题。上游 AITP fork 撞到同一件事，最后也把 SSE 定成默认。这只是传输选择，协议本身没变。
 
 如果你自己已经配置了 `openai-codex`（换 transport、钉模型列表、改 endpoint），插件**不会覆盖**：它会报 `already-configured-differently` 然后放着不动。
+
+API key 那条 route 的 profile 只有两行，规则同样「已存在就不覆盖」：
+
+```js
+{ apiKeyEnv: 'OPENAI_API_KEY', transport: 'sse' }
+```
+
+- **`apiKeyEnv` 是必须的**：没有它，pi-ai 的 `resolveProviderAuth` 根本不会去找 `api_key` 类型的存储凭据（`openai` 的 catalog auth 有 `apiKey`，但默认只从环境变量发现）。写上它之后，`dsh-llm-pi-ai` 的 `routeAuth()` 会给这条 catalog route 补一个 `harnessApiKeyAuth`，值从 Harness 凭据库按 reference 解析 —— key 因此**不经过插件内存里的任何持久结构**，与 Models 页写的是同一份。
+- 不写 `api` / `baseURL` / `models` → 全部回落到内置目录（`api.openai.com/v1`、40+ 个模型、`openai-responses` 协议），插件不复制一份会漂移的模型表。
+- 绑定到别的 reference 的既有 profile 也会被原样保留，只是面板会告诉你哪个 reference 正在生效。
 
 ## 安装
 
@@ -154,25 +190,31 @@ Cordis patch 对匹配到的条目是**整段替换**、不深合并（`dsh-app-
     - id: gpt-codex
       name: 'dsh-gpt-codex'
       config:
-        codexAuthPath: ''      # 空 = $CODEX_HOME 或 ~/.codex
-        autoEnableRoute: true  # 已有凭据时自动补上 openai-codex route
+        codexAuthPath: ''        # 空 = $CODEX_HOME 或 ~/.codex
+        autoEnableRoute: true    # 已有 ChatGPT 凭据时自动补上 openai-codex route
+        apiKeyEnv: 'OPENAI_API_KEY'  # key 存在哪个 reference（也是 Models 页写的那个名字）
+        enableApiKeyRoute: true  # 有 key 时自动补上 openai route；false 则本插件完全不碰它
 ```
+
+`apiKeyEnv` 里的名字必须匹配 `^[A-Za-z_][A-Za-z0-9_]*$`（凭据 seam 的语法），写错会在加载时直接抛错，而不是等第一次请求失败。
 
 ## 测试
 
 ```bash
-node test-host.mjs      # 36 项：桥接、route 启用、OAuth 状态机、工具、路由、客户端包形态、slot 契约、刷新自愈、真实探测
-node test-contract.mjs  #  7 项：record 是否能通过真实 store 的准入规则；与已安装 pi-ai 目录交叉验证
+node test-host.mjs      # 50 项：桥接、route 启用、OAuth 状态机、工具、路由、客户端包形态、slot 契约、刷新自愈、真实探测
+                        #        + API key 的写入/删除/验证/route 保持、shape 校验、自定义 reference、启动自动启用
+node test-contract.mjs  #  8 项：record 是否能通过真实 store 的准入规则；两条 route 的 profile 与已安装 pi-ai 目录/schema 交叉验证
 ```
 
-两个测试都不联网、不发起真实 OAuth、不碰真实凭据库（用替身），`test-contract.mjs` 会从已安装的 `app.asar` 里读出真实的 `openai-codex` 目录做交叉验证。
+两个测试都不联网、不发起真实 OAuth、不碰真实凭据库（用替身），`test-contract.mjs` 会从已安装的 `app.asar` 里读出真实的 `openai-codex` / `openai` 目录与 `llm-pi-ai` 的 schema 做交叉验证。
 
 ## 已知边界
 
-- **必须有真实的 ChatGPT 订阅账号。** 插件不绕过计费或授权。
+- **订阅那条路必须有真实的 ChatGPT 账号。** 插件不绕过计费或授权。
 - **`begin()` 只确认「本次 attempt 内 record 被提交」，不保证 token 可用。** 首次真实请求能否被 codex 后端接受，需要真实网络与订阅才能证明 —— 这不在本插件的测试范围内。
+- **API key 那条路在本仓库里只做了离线单测。** 测试用的是替身凭据与假 `fetch`，没有真的打过 `api.openai.com`。真实端到端验证需要一把有效的 Platform key（会消耗额度，虽然 `/v1/models` 不花 token）。
 - **面板里的浏览器登录依赖 Host 进程存活**；页面刷新会丢掉进行中的 attempt。
-- **Codex CLI 那条路只有在 `auth_mode: chatgpt` 时可用**；`auth_mode: apikey` 会被明确拒绝（不会悄悄搬一个错误形状进去）。
+- **Codex CLI 那条路只有在 `auth_mode: chatgpt` 时可用**；`auth_mode: apikey` 会被明确拒绝（不会悄悄搬一个错误形状进去）。注意：那个拒绝是**对的** —— Codex CLI 里存的 `apikey` 是给 `openai-codex-responses` 用的，搬进来只会在第一次请求时炸在 `extractAccountId` 上。
 - pi-ai 的 `originator` 头默认是 `"pi"`。若后端策略要求别的值，需要在 pi-ai 上游改，插件层碰不到。
 
 ## 更多文档

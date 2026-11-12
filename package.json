@@ -1,7 +1,7 @@
 {
   "name": "dsh-gpt-codex",
   "version": "0.1.0",
-  "description": "Use a ChatGPT subscription to drive GPT models inside DeepSeek Harness: sign in with the built-in OpenAI Codex OAuth flow (or reuse an existing Codex CLI login), enable the openai-codex route, and verify the credential with a real request",
+  "description": "Use GPT models inside DeepSeek Harness on either billing path: a ChatGPT subscription (built-in OpenAI Codex OAuth flow, or reuse an existing Codex CLI login) or an OpenAI Platform API key. Enables the openai-codex and openai routes and verifies each credential with a real request",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -15,6 +15,7 @@
     "chatgpt",
     "codex",
     "openai",
+    "api-key",
     "oauth",
     "pi-ai"
   ],
