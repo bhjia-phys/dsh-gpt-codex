@@ -20,6 +20,14 @@
 # autoEnableRoute:     add the openai-codex provider route automatically once a
 #                      ChatGPT credential exists. Set false to configure it by
 #                      hand.
+# apiKeyEnv:           credential reference holding an OpenAI Platform API key.
+#                      Empty falls back to OPENAI_API_KEY, which is also the name
+#                      the Models page writes. The `openai` route is bound to this
+#                      reference, so the key keeps flowing through the Harness
+#                      credential store instead of living inside this plugin.
+# enableApiKeyRoute:   allow the plugin to enable the `openai` route (API key,
+#                      api.openai.com). Set false to keep the plugin strictly on
+#                      the ChatGPT-subscription route.
 
 - insert:
     - id: gpt-codex
@@ -28,3 +36,5 @@
         codexAuthPath: ''
         proxy: 'http://127.0.0.1:7897'
         autoEnableRoute: true
+        apiKeyEnv: 'OPENAI_API_KEY'
+        enableApiKeyRoute: true

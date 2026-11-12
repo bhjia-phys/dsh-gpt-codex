@@ -134,6 +134,8 @@ window.__ModuleLoader__.load({
       const [attempt, setAttempt] = React.useState(undefined);
       const [answer, setAnswer] = React.useState('');
       const [probe, setProbe] = React.useState(undefined);
+      const [apiKey, setApiKey] = React.useState('');
+      const [apiKeyProbe, setApiKeyProbe] = React.useState(undefined);
 
       const refresh = React.useCallback(async () => {
         try {
@@ -251,6 +253,54 @@ window.__ModuleLoader__.load({
           return `真实请求验证失败 —— ${detail}`;
         });
 
+      /**
+       * Store a Platform key.
+       *
+       * The field is cleared as soon as the Host accepts it — the key's only home
+       * is the credential store, and leaving it in a React state would keep it
+       * visible in the DOM for as long as the page stays open.
+       */
+      const saveApiKey = () =>
+        run('save-key', async () => {
+          const result = await call('/api-key', { method: 'POST', body: { apiKey } });
+          setApiKey('');
+          setApiKeyProbe(result.probe);
+          const routeNote = result.route?.changed
+            ? '已自动启用 openai route。'
+            : result.route?.reason === 'already-configured'
+              ? 'openai route 早已存在。'
+              : `openai route 未改动（${result.route?.reason ?? 'unknown'}）。`;
+          const probeNote =
+            result.probe === undefined
+              ? ''
+              : result.probe.ok === true
+                ? `真实验证通过 —— ${result.probe.detail}`
+                : `真实验证失败 —— ${result.probe.detail}`;
+          return [`已保存 API key（reference ${result.ref}）。`, routeNote, probeNote].filter((part) => part !== '').join(' ');
+        });
+
+      const clearApiKey = () =>
+        run('clear-key', async () => {
+          const result = await call('/api-key', { method: 'DELETE' });
+          setApiKeyProbe(undefined);
+          return `已删除本机保存的 API key（reference ${result.ref}）。`;
+        });
+
+      const verifyApiKey = () =>
+        run('verify-key', async () => {
+          const result = await call('/api-key/verify');
+          setApiKeyProbe(result.probe);
+          return result.probe?.ok === true
+            ? `API key 验证通过 —— ${result.probe.detail}`
+            : `API key 验证失败 —— ${result.probe?.detail ?? '没有拿到结果'}`;
+        });
+
+      const enableApiKeyRoute = () =>
+        run('key-route', async () => {
+          const result = await call('/api-key/route', { method: 'POST', body: {} });
+          return result.changed ? '已启用 openai route（API key）。' : `route 未改动（${result.reason}）。`;
+        });
+
       if (status === undefined) {
         return React.createElement(
           'div',
@@ -263,6 +313,7 @@ window.__ModuleLoader__.load({
       const credential = status.credential ?? {};
       const cli = status.codexCli ?? {};
       const route = status.route ?? {};
+      const key = status.apiKey ?? {};
       const attemptPhase = attempt?.phase ?? 'idle';
       const question = attempt?.question;
 
@@ -273,7 +324,7 @@ window.__ModuleLoader__.load({
         React.createElement(
           'p',
           { style: { ...styles.hint, marginTop: 0 } },
-          '用 ChatGPT 订阅直接驱动这个桌面版。底层适配器（pi-ai 的 openai-codex）已经装好，这里只补上「登录」与「启用这条 route」两件事。',
+          '两条独立的路都能把 GPT 接进这个桌面版：一条用 ChatGPT 订阅（pi-ai 的 openai-codex，需要登录），一条用 OpenAI Platform 的 API key（标准按量计费，不需要订阅）。两条可以同时开着，切模型时各选各的。',
         ),
 
         React.createElement(
@@ -382,6 +433,123 @@ window.__ModuleLoader__.load({
           message === '' ? null : React.createElement('p', { style: styles.ok }, message),
         ),
 
+        // ---------------------------------------------------------- API key ---
+        //
+        // A separate card because it is a separate route with a separate billing
+        // model. Mixing it into the subscription card would read as "two ways to
+        // do the same thing", which is the one thing this is not.
+        React.createElement(
+          'div',
+          { style: styles.card },
+          React.createElement('h2', { style: styles.title }, 'OpenAI API key（按量计费）'),
+          React.createElement(
+            'p',
+            { style: { ...styles.hint, marginTop: 0 } },
+            '填一个 Platform API key（',
+            React.createElement('code', null, 'sk-…'),
+            '），就会启用 llm-pi-ai 的 ',
+            React.createElement('code', null, 'openai'),
+            ' 这条 route，走 api.openai.com。它和上面的订阅登录互不影响，可以同时存在。',
+          ),
+          React.createElement(
+            Row,
+            { label: 'API key' },
+            key.configured
+              ? React.createElement(
+                  'span',
+                  null,
+                  React.createElement('span', { style: styles.badge('on') }, '已保存'),
+                  key.family === 'project'
+                    ? ' project key（项目级）'
+                    : key.family === 'user'
+                      ? ' user key（用户级）'
+                      : '',
+                  key.source ? ` · 来源 ${key.source}` : '',
+                )
+              : React.createElement('span', { style: styles.badge('off') }, '未保存'),
+          ),
+          React.createElement(Row, { label: '凭据 reference' }, key.ref ?? 'OPENAI_API_KEY'),
+          React.createElement(
+            Row,
+            { label: 'openai route' },
+            key.enabled === false
+              ? '已在此插件配置里关闭'
+              : key.route?.configured
+                ? React.createElement(
+                    'span',
+                    null,
+                    React.createElement('span', { style: styles.badge('on') }, '已启用'),
+                    key.route.apiKeyEnv ? ` · 绑定 ${key.route.apiKeyEnv}` : ' · 未绑定 apiKeyEnv',
+                  )
+                : React.createElement('span', { style: styles.badge('off') }, '未启用'),
+          ),
+          React.createElement('input', {
+            style: styles.input,
+            type: 'password',
+            value: apiKey,
+            placeholder: key.configured ? '要替换的话，粘贴新的 key（不会回显已保存的值）' : 'sk-...',
+            onChange: (event) => setApiKey(event.target.value),
+            autoComplete: 'off',
+            spellCheck: false,
+          }),
+          React.createElement(
+            'div',
+            { style: styles.buttons },
+            React.createElement(
+              'button',
+              {
+                type: 'button',
+                style: apiKey.trim() === '' ? styles.button : styles.primary,
+                disabled: busy !== '' || apiKey.trim() === '' || key.enabled === false,
+                onClick: saveApiKey,
+                title: '把 key 写进 Harness 凭据库，并启用 openai route',
+              },
+              busy === 'save-key' ? '保存中…' : '保存并启用',
+            ),
+            key.route?.configured
+              ? null
+              : React.createElement(
+                  'button',
+                  { type: 'button', style: styles.button, disabled: busy !== '' || key.enabled === false, onClick: enableApiKeyRoute },
+                  busy === 'key-route' ? '启用中…' : '仅启用 route',
+                ),
+            key.configured
+              ? React.createElement(
+                  'button',
+                  { type: 'button', style: styles.button, disabled: busy !== '', onClick: verifyApiKey },
+                  busy === 'verify-key' ? '验证中…' : '验证 key',
+                )
+              : null,
+            key.configured
+              ? React.createElement(
+                  'button',
+                  { type: 'button', style: styles.danger, disabled: busy !== '', onClick: clearApiKey },
+                  busy === 'clear-key' ? '删除中…' : '删除 key',
+                )
+              : null,
+          ),
+          apiKeyProbe === undefined
+            ? null
+            : React.createElement(
+                Row,
+                { label: 'key 验证' },
+                React.createElement(
+                  'span',
+                  { style: apiKeyProbe.ok === true ? styles.ok : styles.error },
+                  `${apiKeyProbe.ok === true ? '通过' : '失败'} —— ${apiKeyProbe.detail}`,
+                ),
+              ),
+          React.createElement(
+            'p',
+            { style: styles.hint },
+            '验证是对 ',
+            React.createElement('code', null, 'api.openai.com/v1/models'),
+            ' 发一次不带 token 费用的请求，只会说明 key 是否被接受、以及能看见多少个模型。key 保存后与「设置 → 模型」里填的 ',
+            React.createElement('code', null, 'OPENAI_API_KEY'),
+            ' 是同一个值。',
+          ),
+        ),
+
         attemptPhase === 'idle'
           ? null
           : React.createElement(
@@ -474,35 +642,41 @@ window.__ModuleLoader__.load({
      *
      * `settings.models.provider-card` is dispatched inside every card that shows
      * a pi-ai directory row, with `entryKey = settingsNs` — so this registration
-     * only ever renders on the `llm-pi-ai` family, which is exactly the family
-     * that owns `openai-codex`. The row exists in the directory even before the
-     * route is configured (the directory is catalog ∪ configured), which is what
-     * lets the sign-in button appear on the very card where a user would look
-     * for it.
+     * only ever renders on the `llm-pi-ai` family, which owns both routes this
+     * plugin enables. The row exists in the directory even before the route is
+     * configured (the directory is catalog ∪ configured), which is what lets the
+     * button appear on the very card where a user would look for it.
+     *
+     * Two rows matter here and they are not the same row: `openai-codex` is the
+     * subscription route, `openai` is the API-key route. Each gets its own
+     * one-line explanation and its own action, because the fix for "nothing is
+     * configured" differs completely between them.
      *
      * Owner props: `{ provider: ProviderDirectoryEntry, configured: boolean,
      * keyConfigured: boolean }`.
      */
     function ModelsCard(props) {
-      const isCodex = props?.provider?.provider === 'openai-codex';
+      const providerId = props?.provider?.provider;
+      const isCodex = providerId === 'openai-codex';
+      const isApiKey = providerId === 'openai';
       const [status, setStatus] = React.useState(undefined);
       const [busy, setBusy] = React.useState('');
       const [note, setNote] = React.useState('');
 
       const refresh = React.useCallback(async () => {
-        if (!isCodex) return;
+        if (!isCodex && !isApiKey) return;
         try {
           setStatus(await call('/status'));
         } catch {
           setStatus(undefined);
         }
-      }, [isCodex]);
+      }, [isCodex, isApiKey]);
 
       React.useEffect(() => {
         void refresh();
       }, [refresh]);
 
-      if (!isCodex) return null;
+      if (!isCodex && !isApiKey) return null;
 
       const bridge = async () => {
         setBusy('bridge');
@@ -518,6 +692,33 @@ window.__ModuleLoader__.load({
         }
       };
 
+      if (isApiKey) {
+        const key = status?.apiKey ?? {};
+        return React.createElement(
+          'div',
+          { style: { marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--dsw-alias-border-l1)' } },
+          React.createElement(
+            'p',
+            { style: { margin: '0 0 8px', fontSize: 12, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.6 } },
+            key.configured
+              ? `Platform API key 已保存（reference ${key.ref}）${key.family === 'project' ? '，project key' : key.family === 'user' ? '，user key' : ''}。`
+              : '这条 provider 走 OpenAI Platform 的按量计费，需要一个 sk-… 形式的 API key。',
+          ),
+          React.createElement(
+            'span',
+            { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } },
+            '在本行下方直接填 key，或到「设置 → GPT 接入」里管理与验证。',
+          ),
+          note === ''
+            ? null
+            : React.createElement(
+                'p',
+                { style: { margin: '8px 0 0', fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } },
+                note,
+              ),
+        );
+      }
+
       const cli = status?.codexCli;
       const credential = status?.credential ?? {};
       return React.createElement(
@@ -530,7 +731,7 @@ window.__ModuleLoader__.load({
             ? `ChatGPT 订阅凭据已保存${credential.expired ? '（access token 已过期，下次请求自动刷新）' : ''}。`
             : cli?.bridgeable
               ? `检测到 Codex CLI 的 ChatGPT 登录${cli.planType ? `（套餐 ${cli.planType}）` : ''}，可直接复用。`
-              : '这个 provider 只支持 ChatGPT 订阅登录（OAuth），没有 API key 可填。',
+              : '这条 provider 只认 ChatGPT 订阅登录（OAuth），不读 API key；要用 key 请选同一目录下的 openai。',
         ),
         React.createElement(
           'div',
